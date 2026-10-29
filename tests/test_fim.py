@@ -65,6 +65,16 @@ class TestFileIntegrityMonitor(unittest.TestCase):
                 with self.assertRaisesRegex(OSError, "Scan incomplete"):
                     scan_directories([directory])
 
+    def test_preexisting_modification_detection(self):
+        baseline = {"/lab/file.txt": "original"}
+        previous = baseline.copy()
+        current = {"/lab/file.txt": "tampered"}
+
+        with patch("src.fim.log_event") as log_event:
+            report_changes(previous, current, baseline)
+
+        log_event.assert_called_once_with("[MODIFIED] /lab/file.txt")
+
 
 if __name__ == "__main__":
     unittest.main()

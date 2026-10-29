@@ -16,6 +16,7 @@ CHUNK_SIZE = 4096
 
 
 def timestamp():
+    """Return a UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -45,7 +46,7 @@ def normalize_directories(directories):
 
 
 def scan_directories(directories):
-    """Return hashes keyed by absolute file path."""
+    """Return SHA-256 hashes keyed by absolute file path."""
     results = {}
 
     for directory in directories:
@@ -55,13 +56,18 @@ def scan_directories(directories):
 
             resolved = path.resolve()
 
-            if resolved in {BASELINE_FILE.resolve(), EVENT_LOG.resolve()}:
+            if resolved in {
+                BASELINE_FILE.resolve(),
+                EVENT_LOG.resolve(),
+            }:
                 continue
 
             try:
                 results[str(resolved)] = calculate_hash(resolved)
             except OSError as error:
-                 raise OSError(f"Scan incomplete: cannot read {resolved}: {error}") from error
+                raise OSError(
+                    f"Scan incomplete: cannot read {resolved}: {error}"
+                ) from error
 
     return results
 
@@ -75,11 +81,14 @@ def load_baseline_data():
 
     data = json.loads(BASELINE_FILE.read_text(encoding="utf-8"))
 
+    if not isinstance(data, dict):
+        raise ValueError("Invalid baseline format.")
+
     if data.get("algorithm") != "SHA-256":
         raise ValueError("Unsupported baseline algorithm.")
 
     if not isinstance(data.get("files"), dict):
-        raise ValueError("Invalid baseline format.")
+        raise ValueError("Invalid baseline file list.")
 
     if not isinstance(data.get("directories"), list):
         raise ValueError("Baseline has no valid directory list.")
@@ -88,6 +97,7 @@ def load_baseline_data():
 
 
 def load_baseline():
+    """Load the saved file hashes."""
     return load_baseline_data()["files"]
 
 
@@ -108,7 +118,10 @@ def save_baseline(directories):
     )
 
     print(f"[INFO] Baseline saved to {BASELINE_FILE}")
-    print(f"[INFO] Recorded {len(files)} files across {len(directories)} directories.")
+    print(
+        f"[INFO] Recorded {len(files)} files "
+        f"across {len(directories)} directories."
+    )
 
 
 def log_event(message):
@@ -121,7 +134,7 @@ def log_event(message):
 
 
 def report_changes(previous, current, baseline):
-    """Report state transitions without repeating unchanged alerts."""
+    """Report file-state transitions without repeating unchanged alerts."""
     for name in sorted(set(previous) | set(current)):
         old_hash = previous.get(name)
         new_hash = current.get(name)
@@ -144,21 +157,24 @@ def report_changes(previous, current, baseline):
 
 
 def check_directories(directories, baseline, previous):
-    """Perform a scan and report changes since the previous scan."""
+    """Scan directories and report changes since the previous scan."""
     current = scan_directories(directories)
     report_changes(previous, current, baseline)
     return current
 
 
 class ChangeHandler(FileSystemEventHandler):
-    """Wake the monitor when a filesystem event occurs."""
+    """Signal the monitor when a filesystem event occurs."""
 
     def __init__(self, changed):
         self.changed = changed
 
     def on_any_event(self, event):
         if not event.is_directory and event.event_type in {
-            "created", "modified", "deleted", "moved"
+            "created",
+            "modified",
+            "deleted",
+            "moved",
         }:
             self.changed.set()
 
@@ -174,7 +190,9 @@ def monitor(directories, interval):
             "Create a new baseline for these directories."
         )
 
-    previous = scan_directories(directories)
+    # Start from the trusted baseline so pre-existing changes are detected.
+    previous = baseline.copy()
+
     changed = threading.Event()
     observer = Observer()
     handler = ChangeHandler(changed)
@@ -189,11 +207,16 @@ def monitor(directories, interval):
 
     try:
         while True:
-            # An event triggers a scan early; timeout ensures periodic scans.
+            # Filesystem events trigger an early scan; timeout ensures
+            # periodic checks even when no event is received.
             changed.wait(timeout=interval)
             changed.clear()
             time.sleep(0.2)
-            previous = check_directories(directories, baseline, previous)
+            previous = check_directories(
+                directories,
+                baseline,
+                previous,
+            )
     except KeyboardInterrupt:
         print("\n[INFO] Monitoring stopped.")
     finally:
@@ -205,6 +228,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Multi-directory SHA-256 File Integrity Monitor."
     )
+
     parser.add_argument(
         "--dirs",
         nargs="+",
@@ -213,9 +237,21 @@ def main():
     )
 
     actions = parser.add_mutually_exclusive_group(required=True)
-    actions.add_argument("--baseline", action="store_true", help="Create a baseline")
-    actions.add_argument("--check", action="store_true", help="Check integrity once")
-    actions.add_argument("--monitor", action="store_true", help="Monitor continuously")
+    actions.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Create a baseline",
+    )
+    actions.add_argument(
+        "--check",
+        action="store_true",
+        help="Check integrity once",
+    )
+    actions.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Monitor continuously",
+    )
 
     parser.add_argument(
         "--interval",
@@ -237,8 +273,11 @@ def main():
 
         elif args.check:
             data = load_baseline_data()
+
             if {str(item) for item in directories} != set(data["directories"]):
-                raise ValueError("Selected directories do not match the baseline.")
+                raise ValueError(
+                    "Selected directories do not match the baseline."
+                )
 
             baseline = data["files"]
             current = scan_directories(directories)
@@ -246,7 +285,8 @@ def main():
             added = sorted(set(current) - set(baseline))
             deleted = sorted(set(baseline) - set(current))
             modified = sorted(
-                name for name in set(current) & set(baseline)
+                name
+                for name in set(current) & set(baseline)
                 if current[name] != baseline[name]
             )
 
@@ -255,8 +295,10 @@ def main():
 
             for name in added:
                 log_event(f"[NEW] {name}")
+
             for name in modified:
                 log_event(f"[MODIFIED] {name}")
+
             for name in deleted:
                 log_event(f"[DELETED] {name}")
 
