@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -10,8 +11,8 @@ from pathlib import Path
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-BASELINE_FILE = Path(".fim_baseline.json")
-EVENT_LOG = Path("fim_events.log")
+BASELINE_FILE = Path(".fim_baseline.json").resolve()
+EVENT_LOG = Path("fim_events.log").resolve()
 CHUNK_SIZE = 4096
 
 
@@ -32,7 +33,7 @@ def calculate_hash(file_path):
 
 
 def normalize_directories(directories):
-    """Resolve and validate the user-selected directories."""
+    """Resolve and validate selected directories."""
     resolved = list(dict.fromkeys(Path(item).resolve() for item in directories))
 
     if not resolved:
@@ -46,34 +47,52 @@ def normalize_directories(directories):
 
 
 def scan_directories(directories):
-    """Return SHA-256 hashes keyed by absolute file path."""
+    """Hash files and fail explicitly if traversal or reading fails."""
     results = {}
+    excluded = {BASELINE_FILE, EVENT_LOG}
+
+    def raise_walk_error(error):
+        raise error
 
     for directory in directories:
-        for path in directory.rglob("*"):
-            if not path.is_file():
-                continue
+        for root, dirnames, filenames in os.walk(
+            directory,
+            topdown=True,
+            onerror=raise_walk_error,
+            followlinks=False,
+        ):
+            # Avoid traversing directory symlinks.
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not (Path(root) / name).is_symlink()
+            ]
 
-            resolved = path.resolve()
+            for filename in filenames:
+                path = Path(root) / filename
 
-            if resolved in {
-                BASELINE_FILE.resolve(),
-                EVENT_LOG.resolve(),
-            }:
-                continue
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
 
-            try:
-                results[str(resolved)] = calculate_hash(resolved)
-            except OSError as error:
-                raise OSError(
-                    f"Scan incomplete: cannot read {resolved}: {error}"
-                ) from error
+                    resolved = path.resolve()
+
+                    if resolved in excluded:
+                        continue
+
+                    results[str(resolved)] = calculate_hash(resolved)
+
+                except OSError as error:
+                    raise OSError(
+                        f"Scan incomplete: cannot inspect or read "
+                        f"{path}: {error}"
+                    ) from error
 
     return results
 
 
 def load_baseline_data():
-    """Load and validate the baseline document."""
+    """Load and validate the saved baseline document."""
     if not BASELINE_FILE.exists():
         raise FileNotFoundError(
             "No baseline found. Run with --baseline first."
@@ -93,16 +112,22 @@ def load_baseline_data():
     if not isinstance(data.get("directories"), list):
         raise ValueError("Baseline has no valid directory list.")
 
+    if not all(
+        isinstance(name, str) and isinstance(digest, str)
+        for name, digest in data["files"].items()
+    ):
+        raise ValueError("Baseline contains invalid file entries.")
+
     return data
 
 
 def load_baseline():
-    """Load the saved file hashes."""
+    """Load saved file hashes."""
     return load_baseline_data()["files"]
 
 
 def save_baseline(directories):
-    """Create a baseline for all selected directories."""
+    """Create a baseline for selected directories."""
     files = scan_directories(directories)
 
     data = {
@@ -157,7 +182,7 @@ def report_changes(previous, current, baseline):
 
 
 def check_directories(directories, baseline, previous):
-    """Scan directories and report changes since the previous scan."""
+    """Scan and report changes since the previous snapshot."""
     current = scan_directories(directories)
     report_changes(previous, current, baseline)
     return current
@@ -180,7 +205,7 @@ class ChangeHandler(FileSystemEventHandler):
 
 
 def monitor(directories, interval):
-    """Monitor filesystem events and perform periodic integrity checks."""
+    """Monitor filesystem events and periodically verify file integrity."""
     data = load_baseline_data()
     baseline = data["files"]
 
@@ -190,7 +215,7 @@ def monitor(directories, interval):
             "Create a new baseline for these directories."
         )
 
-    # Start from the trusted baseline so pre-existing changes are detected.
+    # Compare the first scan against the trusted baseline.
     previous = baseline.copy()
 
     changed = threading.Event()
@@ -207,18 +232,18 @@ def monitor(directories, interval):
 
     try:
         while True:
-            # Filesystem events trigger an early scan; timeout ensures
-            # periodic checks even when no event is received.
             changed.wait(timeout=interval)
             changed.clear()
+
+            # Briefly allow bursts of filesystem events to settle.
             time.sleep(0.2)
-            previous = check_directories(
-                directories,
-                baseline,
-                previous,
-            )
+
+            # If a scan fails, do not update the previous snapshot.
+            previous = check_directories(directories, baseline, previous)
+
     except KeyboardInterrupt:
         print("\n[INFO] Monitoring stopped.")
+
     finally:
         observer.stop()
         observer.join()
@@ -237,21 +262,9 @@ def main():
     )
 
     actions = parser.add_mutually_exclusive_group(required=True)
-    actions.add_argument(
-        "--baseline",
-        action="store_true",
-        help="Create a baseline",
-    )
-    actions.add_argument(
-        "--check",
-        action="store_true",
-        help="Check integrity once",
-    )
-    actions.add_argument(
-        "--monitor",
-        action="store_true",
-        help="Monitor continuously",
-    )
+    actions.add_argument("--baseline", action="store_true", help="Create a baseline")
+    actions.add_argument("--check", action="store_true", help="Check integrity once")
+    actions.add_argument("--monitor", action="store_true", help="Monitor continuously")
 
     parser.add_argument(
         "--interval",
@@ -302,11 +315,15 @@ def main():
             for name in deleted:
                 log_event(f"[DELETED] {name}")
 
-        elif args.monitor:
-            monitor(directories, args.interval)
-
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.exit(1, f"[ERROR] {error}\n")
+
+    else:
+        if args.monitor:
+            try:
+                monitor(directories, args.interval)
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                parser.exit(1, f"[ERROR] {error}\n")
 
 
 if __name__ == "__main__":

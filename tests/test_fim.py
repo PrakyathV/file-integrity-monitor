@@ -75,6 +75,21 @@ class TestFileIntegrityMonitor(unittest.TestCase):
 
         log_event.assert_called_once_with("[MODIFIED] /lab/file.txt")
 
+    def test_directory_traversal_error_fails_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+
+            with patch(
+                "src.fim.os.walk",
+                side_effect=lambda *args, **kwargs: self._raise_walk_error(),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated traversal failure"):
+                    scan_directories([directory])
+
+    @staticmethod
+    def _raise_walk_error():
+        raise PermissionError("simulated traversal failure")
+
 
 if __name__ == "__main__":
     unittest.main()
