@@ -5,24 +5,27 @@ import json
 import os
 import threading
 import time
+
 from datetime import datetime, timezone
 from pathlib import Path
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-BASELINE_FILE = Path(".fim_baseline.json").resolve()
+
+CONFIG_FILE = Path("fim_config.json").resolve()
+BASELINE_DIR = Path(".fim_baselines").resolve()
 EVENT_LOG = Path("fim_events.log").resolve()
+
 CHUNK_SIZE = 4096
+DEFAULT_INTERVAL = 5
 
 
 def timestamp():
-    """Return a UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def calculate_hash(file_path):
-    """Calculate a SHA-256 hash using chunked reading."""
     digest = hashlib.sha256()
 
     with open(file_path, "rb") as file:
@@ -33,39 +36,195 @@ def calculate_hash(file_path):
 
 
 def normalize_directories(directories):
-    """Resolve and validate selected directories."""
-    resolved = list(dict.fromkeys(Path(item).resolve() for item in directories))
+    resolved = sorted(
+        {Path(item).expanduser().resolve() for item in directories},
+        key=str,
+    )
 
     if not resolved:
         raise ValueError("Select at least one directory.")
 
     for directory in resolved:
         if not directory.is_dir():
-            raise ValueError(f"Not a directory: {directory}")
+            raise ValueError(f"Not a valid directory: {directory}")
+
+    for index, directory in enumerate(resolved):
+        for other in resolved[index + 1:]:
+            if directory in other.parents:
+                raise ValueError(
+                    f"Overlapping folders are not allowed: "
+                    f"{directory} and {other}"
+                )
 
     return resolved
 
 
+def configuration_id(directories):
+    canonical = "\n".join(
+        sorted(str(Path(item).resolve()) for item in directories)
+    )
+
+    return hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def baseline_path(directories):
+    return BASELINE_DIR / f"{configuration_id(directories)}.json"
+
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        return {
+            "directories": [],
+            "interval": DEFAULT_INTERVAL,
+        }
+
+    try:
+        data = json.loads(
+            CONFIG_FILE.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError("Configuration contains invalid JSON.") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("Invalid configuration format.")
+
+    directories = data.get("directories", [])
+    interval = data.get("interval", DEFAULT_INTERVAL)
+
+    if not isinstance(directories, list) or not all(
+        isinstance(item, str) for item in directories
+    ):
+        raise ValueError("Invalid directory configuration.")
+
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, int)
+        or interval < 1
+    ):
+        raise ValueError("Monitoring interval must be positive.")
+
+    return {
+        "directories": directories,
+        "interval": interval,
+    }
+
+
+def save_config(directories, interval):
+    data = {
+        "directories": [str(item) for item in directories],
+        "interval": interval,
+        "updated_at": timestamp(),
+    }
+
+    CONFIG_FILE.write_text(
+        json.dumps(data, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"[INFO] Configuration saved: {CONFIG_FILE}")
+
+
+def select_directories():
+    config = load_config()
+    selected = []
+
+    for item in config["directories"]:
+        path = Path(item).expanduser()
+
+        if path.is_dir():
+            selected.append(path.resolve())
+
+    while True:
+        print("\n========== FIM Folder Selection ==========")
+        print("1. Add a folder")
+        print("2. Remove a folder")
+        print("3. Show selected folders")
+        print("4. Save and continue")
+        print("5. Exit")
+
+        choice = input("\nChoose an option: ").strip()
+
+        if choice == "1":
+            folder = input("Enter folder path: ").strip()
+
+            if not folder:
+                print("[ERROR] Folder path cannot be empty.")
+                continue
+
+            try:
+                selected = normalize_directories(
+                    selected + [Path(folder)]
+                )
+                print("[INFO] Folder added.")
+            except (ValueError, OSError) as error:
+                print(f"[ERROR] {error}")
+
+        elif choice == "2":
+            if not selected:
+                print("[INFO] No folders selected.")
+                continue
+
+            for index, folder in enumerate(selected, 1):
+                print(f"{index}. {folder}")
+
+            try:
+                number = int(input("Folder number to remove: "))
+
+                if not 1 <= number <= len(selected):
+                    print("[ERROR] Invalid selection.")
+                    continue
+
+                removed = selected.pop(number - 1)
+                print(f"[INFO] Removed: {removed}")
+
+            except ValueError:
+                print("[ERROR] Enter a valid number.")
+
+        elif choice == "3":
+            if not selected:
+                print("[INFO] No folders selected.")
+            else:
+                for index, folder in enumerate(selected, 1):
+                    print(f"{index}. {folder}")
+
+        elif choice == "4":
+            if not selected:
+                print("[ERROR] Select at least one folder.")
+                continue
+
+            return normalize_directories(selected)
+
+        elif choice == "5":
+            raise SystemExit(0)
+
+        else:
+            print("[ERROR] Invalid option.")
+
+
 def scan_directories(directories):
-    """Hash files and fail explicitly if traversal or reading fails."""
     results = {}
-    excluded = {BASELINE_FILE, EVENT_LOG}
+
+    excluded_directories = {BASELINE_DIR}
+    excluded_files = {CONFIG_FILE, EVENT_LOG}
 
     def raise_walk_error(error):
         raise error
 
-    for directory in directories:
+    for directory in normalize_directories(directories):
         for root, dirnames, filenames in os.walk(
             directory,
             topdown=True,
             onerror=raise_walk_error,
             followlinks=False,
         ):
-            # Avoid traversing directory symlinks.
             dirnames[:] = [
                 name
                 for name in dirnames
                 if not (Path(root) / name).is_symlink()
+                and (Path(root) / name).resolve()
+                not in excluded_directories
             ]
 
             for filename in filenames:
@@ -77,7 +236,7 @@ def scan_directories(directories):
 
                     resolved = path.resolve()
 
-                    if resolved in excluded:
+                    if resolved in excluded_files:
                         continue
 
                     results[str(resolved)] = calculate_hash(resolved)
@@ -91,14 +250,18 @@ def scan_directories(directories):
     return results
 
 
-def load_baseline_data():
-    """Load and validate the saved baseline document."""
-    if not BASELINE_FILE.exists():
+def load_baseline_data(directories):
+    path = baseline_path(directories)
+
+    if not path.exists():
         raise FileNotFoundError(
-            "No baseline found. Run with --baseline first."
+            "No baseline found. Create one before checking or monitoring."
         )
 
-    data = json.loads(BASELINE_FILE.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError("Baseline contains invalid JSON.") from error
 
     if not isinstance(data, dict):
         raise ValueError("Invalid baseline format.")
@@ -106,29 +269,31 @@ def load_baseline_data():
     if data.get("algorithm") != "SHA-256":
         raise ValueError("Unsupported baseline algorithm.")
 
-    if not isinstance(data.get("files"), dict):
+    if data.get("directories") != [str(item) for item in directories]:
+        raise ValueError("Baseline directory selection does not match.")
+
+    files = data.get("files")
+
+    if not isinstance(files, dict):
         raise ValueError("Invalid baseline file list.")
 
-    if not isinstance(data.get("directories"), list):
-        raise ValueError("Baseline has no valid directory list.")
-
     if not all(
-        isinstance(name, str) and isinstance(digest, str)
-        for name, digest in data["files"].items()
+        isinstance(name, str)
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(char in "0123456789abcdef" for char in digest)
+        for name, digest in files.items()
     ):
-        raise ValueError("Baseline contains invalid file entries.")
+        raise ValueError("Baseline contains invalid file hashes.")
 
     return data
 
 
-def load_baseline():
-    """Load saved file hashes."""
-    return load_baseline_data()["files"]
-
-
 def save_baseline(directories):
-    """Create a baseline for selected directories."""
+    directories = normalize_directories(directories)
     files = scan_directories(directories)
+
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
 
     data = {
         "algorithm": "SHA-256",
@@ -137,20 +302,17 @@ def save_baseline(directories):
         "files": files,
     }
 
-    BASELINE_FILE.write_text(
+    path = baseline_path(directories)
+    path.write_text(
         json.dumps(data, indent=2) + "\n",
         encoding="utf-8",
     )
 
-    print(f"[INFO] Baseline saved to {BASELINE_FILE}")
-    print(
-        f"[INFO] Recorded {len(files)} files "
-        f"across {len(directories)} directories."
-    )
+    print(f"[INFO] Baseline saved: {path}")
+    print(f"[INFO] Recorded {len(files)} files.")
 
 
 def log_event(message):
-    """Print and append a timestamped event."""
     event = f"{timestamp()} {message}"
     print(event)
 
@@ -159,7 +321,6 @@ def log_event(message):
 
 
 def report_changes(previous, current, baseline):
-    """Report file-state transitions without repeating unchanged alerts."""
     for name in sorted(set(previous) | set(current)):
         old_hash = previous.get(name)
         new_hash = current.get(name)
@@ -182,20 +343,18 @@ def report_changes(previous, current, baseline):
 
 
 def check_directories(directories, baseline, previous):
-    """Scan and report changes since the previous snapshot."""
     current = scan_directories(directories)
     report_changes(previous, current, baseline)
     return current
 
 
 class ChangeHandler(FileSystemEventHandler):
-    """Signal the monitor when a filesystem event occurs."""
 
     def __init__(self, changed):
         self.changed = changed
 
     def on_any_event(self, event):
-        if not event.is_directory and event.event_type in {
+        if event.event_type in {
             "created",
             "modified",
             "deleted",
@@ -205,17 +364,8 @@ class ChangeHandler(FileSystemEventHandler):
 
 
 def monitor(directories, interval):
-    """Monitor filesystem events and periodically verify file integrity."""
-    data = load_baseline_data()
+    data = load_baseline_data(directories)
     baseline = data["files"]
-
-    if {str(item) for item in directories} != set(data["directories"]):
-        raise ValueError(
-            "Selected directories do not match the baseline. "
-            "Create a new baseline for these directories."
-        )
-
-    # Compare the first scan against the trusted baseline.
     previous = baseline.copy()
 
     changed = threading.Event()
@@ -227,19 +377,23 @@ def monitor(directories, interval):
         print(f"[INFO] Watching {directory}")
 
     observer.start()
-    print(f"[INFO] Periodic integrity check every {interval} seconds.")
+
+    print(f"[INFO] Integrity checks every {interval} seconds.")
     print("[INFO] Press Ctrl+C to stop.")
 
     try:
+        previous = check_directories(
+            directories, baseline, previous
+        )
+
         while True:
             changed.wait(timeout=interval)
             changed.clear()
-
-            # Briefly allow bursts of filesystem events to settle.
             time.sleep(0.2)
 
-            # If a scan fails, do not update the previous snapshot.
-            previous = check_directories(directories, baseline, previous)
+            previous = check_directories(
+                directories, baseline, previous
+            )
 
     except KeyboardInterrupt:
         print("\n[INFO] Monitoring stopped.")
@@ -251,47 +405,51 @@ def monitor(directories, interval):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-directory SHA-256 File Integrity Monitor."
+        description="Interactive multi-folder SHA-256 File Integrity Monitor."
     )
 
-    parser.add_argument(
-        "--dirs",
-        nargs="+",
-        default=["sample_files"],
-        help="Directories to monitor (default: sample_files)",
-    )
-
-    actions = parser.add_mutually_exclusive_group(required=True)
-    actions.add_argument("--baseline", action="store_true", help="Create a baseline")
-    actions.add_argument("--check", action="store_true", help="Check integrity once")
-    actions.add_argument("--monitor", action="store_true", help="Monitor continuously")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--select", action="store_true")
+    actions.add_argument("--baseline", action="store_true")
+    actions.add_argument("--check", action="store_true")
+    actions.add_argument("--monitor", action="store_true")
 
     parser.add_argument(
         "--interval",
         type=int,
-        default=5,
-        help="Periodic check interval in seconds (default: 5)",
+        help="Periodic integrity check interval in seconds.",
     )
 
     args = parser.parse_args()
 
-    if args.interval < 1:
+    if args.interval is not None and args.interval < 1:
         parser.error("--interval must be at least 1 second")
 
     try:
-        directories = normalize_directories(args.dirs)
+        if args.select or not any(
+            [args.baseline, args.check, args.monitor]
+        ):
+            directories = select_directories()
+            config = load_config()
+            interval = args.interval or config["interval"]
+            save_config(directories, interval)
+
+            if not args.baseline and not args.check and not args.monitor:
+                print(
+                    "[INFO] Folder configuration ready. "
+                    "Create a baseline before monitoring."
+                )
+                return
+        else:
+            config = load_config()
+            directories = normalize_directories(config["directories"])
+            interval = args.interval or config["interval"]
 
         if args.baseline:
             save_baseline(directories)
 
         elif args.check:
-            data = load_baseline_data()
-
-            if {str(item) for item in directories} != set(data["directories"]):
-                raise ValueError(
-                    "Selected directories do not match the baseline."
-                )
-
+            data = load_baseline_data(directories)
             baseline = data["files"]
             current = scan_directories(directories)
 
@@ -315,15 +473,11 @@ def main():
             for name in deleted:
                 log_event(f"[DELETED] {name}")
 
+        elif args.monitor:
+            monitor(directories, interval)
+
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.exit(1, f"[ERROR] {error}\n")
-
-    else:
-        if args.monitor:
-            try:
-                monitor(directories, args.interval)
-            except (OSError, ValueError, json.JSONDecodeError) as error:
-                parser.exit(1, f"[ERROR] {error}\n")
 
 
 if __name__ == "__main__":

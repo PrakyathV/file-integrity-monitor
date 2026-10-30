@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 .fim_baseline.json
 fim_events.log
+.fim_baselines/
